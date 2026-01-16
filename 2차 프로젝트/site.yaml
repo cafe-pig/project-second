@@ -1,0 +1,187 @@
+---
+# [Tier 1] 프록시 계층: SSL 생성, 이중화 및 Nginx/Keepalived 설정
+- name: 1. Setup External Proxy with SSL Replication
+  hosts: proxies
+  become: yes
+  tasks:
+    # [Local] 앤서블 컨트롤러(내 컴퓨터)에 인증서 보관용 임시 폴더 생성
+    - name: Ensure local temporary directory exists on controller
+      file:
+        path: "{{ playbook_dir }}/ssl_temp"
+        state: directory
+        mode: '0777'
+      delegate_to: localhost
+      run_once: true
+      become: no
+
+    # [Remote] Nginx 및 필수 패키지 설치
+    - name: Install Prerequisites
+      apt:
+        name: [keepalived, nginx, openssl]
+        state: present
+        update_cache: yes
+
+    # [Remote] Nginx 설정 및 로그 디렉토리 존재 보장 (에러 해결 핵심)
+    - name: Ensure Nginx and log directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: www-data
+        group: adm
+      loop:
+        - /etc/nginx/ssl
+        - /etc/nginx/sites-available
+        - /etc/nginx/sites-enabled
+        - /etc/keepalived
+        - /var/log/nginx    # <-- 로그 폴더 생성 추가됨
+
+    # [SSL] proxy-101에서 와일드카드 인증서 생성
+    - name: Generate SSL (proxy-101 only)
+      command: openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/project00.key -out /etc/nginx/ssl/project00.crt -subj "/C=KR/CN=*.project00.com"
+      args: { creates: /etc/nginx/ssl/project00.key }
+      when: inventory_hostname == 'proxy-101'
+
+    # [SSL] 생성된 인증서를 컨트롤러로 가져오기
+    - name: Fetch SSL to controller
+      fetch:
+        src: "/etc/nginx/ssl/{{ item }}"
+        dest: "{{ playbook_dir }}/ssl_temp/"
+        flat: yes
+      loop: ['project00.key', 'project00.crt']
+      when: inventory_hostname == 'proxy-101'
+
+    # [SSL] 컨트롤러에서 모든 프록시 서버로 배포 (이중화)
+    - name: Copy SSL to all proxies
+      copy:
+        src: "{{ playbook_dir }}/ssl_temp/{{ item }}"
+        dest: "/etc/nginx/ssl/{{ item }}"
+        mode: '0600'
+        owner: root
+        group: root
+      loop: ['project00.key', 'project00.crt']
+      notify: Restart Services
+
+    # [Config] Nginx 및 Keepalived 설정 파일 배포
+    - name: Deploy Proxy & HA Config
+      template:
+        src: "./templates/{{ item.src }}"
+        dest: "{{ item.dest }}"
+      loop:
+        - { src: 'nginx_proxy.conf.j2', dest: '/etc/nginx/sites-available/default' }
+        - { src: 'keepalived.conf.j2', dest: '/etc/keepalived/keepalived.conf' }
+      notify: Restart Services
+      
+    # [Exporter] 실행 파일 배포 및 권한 설정
+    - name: Copy Exporter binaries to /usr/local/bin
+      copy:
+        src: "./files/{{ item }}" # 컨트롤러의 files 폴더에 미리 준비해두어야 함
+        dest: "/usr/local/bin/{{ item }}"
+        mode: '0755' # chmod +x 효과 포함
+      loop:
+        - node_exporter
+        - nginx-prometheus-exporter
+
+    # [Systemd] 서비스 등록 (이미지 내용 기반)
+    - name: Deploy Systemd Service files
+      copy:
+        dest: "/etc/systemd/system/{{ item.name }}.service"
+        content: |
+          [Unit]
+          Description={{ item.desc }}
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart={{ item.exec }}
+
+          [Install]
+          WantedBy=multi-user.target
+      loop:
+        - { name: 'node_exporter', desc: 'Node Exporter', exec: '/usr/local/bin/node_exporter' }
+        - { name: 'nginx_exporter', desc: 'Nginx Prometheus Exporter', exec: '/usr/local/bin/nginx-prometheus-exporter -nginx.scrape-uri=http://127.0.0.1/metrics' }
+      notify: Restart Monitoring Services
+
+  handlers:
+    - name: Restart Services
+      service: { name: "{{ item }}", state: restarted, enabled: yes }
+      loop: [keepalived, nginx]
+      
+    - name: Restart Monitoring Services
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      loop: [node_exporter, nginx_exporter]
+
+# [Tier 2] DB 계층: Galera Cluster 자동 초기화 및 설정
+- name: 2. Setup Galera DB Cluster
+  hosts: db_servers
+  become: yes
+  tasks:
+    - name: Install Galera Packages
+      apt: { name: [mariadb-server, mariadb-client, galera-4, python3-pymysql], state: present }
+
+    - name: Deploy Galera Config
+      template: { src: templates/galera.cnf.j2, dest: /etc/mysql/conf.d/galera.conf }
+
+    - name: Check if Galera is already bootstrapped
+      stat: { path: /var/lib/mysql/grastate.dat }
+      register: db_status
+
+    - name: Bootstrap First Node
+      command: galera_new_cluster
+      when: 
+        - inventory_hostname == groups['db_servers'][0]
+        - not db_status.stat.exists
+      notify: Restart MariaDB
+
+    - name: Start MariaDB on All Nodes
+      service: { name: mariadb, state: started, enabled: yes }
+      
+    - name: Create Database and Tables (Run on First Node)
+      mysql_db:
+        name: project00_db
+        state: present
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      when: inventory_hostname == groups['db_servers'][0]
+
+    - name: Initialize DB Schema
+      mysql_query:
+        login_db: project00_db
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        query: 
+          - CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50), password VARCHAR(50));
+          - CREATE TABLE IF NOT EXISTS posts (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(100), author VARCHAR(50));
+          - INSERT INTO posts (title, author) SELECT '첫 게시글입니다', 'admin' FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM posts);
+      when: inventory_hostname == groups['db_servers'][0]
+
+  handlers:
+    - name: Restart MariaDB
+      service: name=mariadb state=restarted
+
+# [Tier 3] 앱 계층: K8s 게시판 WAS 배포
+- name: 3. Deploy 3-Tier Application to K8s
+  hosts: kube_control_plane
+  become: yes
+  tasks:
+# 1. 기존 리소스 전체를 강제로(force) 삭제하여 etcd 기록 정리
+    - name: Force cleanup existing resources
+      shell: |
+        kubectl delete -f /tmp/3tier-stack.yaml --ignore-not-found=true --grace-period=0 --force
+      environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
+      failed_when: false # 삭제할 파일이 없어도 무시하고 진행
+
+    # 2. 쿠버네티스 API 서버가 포트 해제를 완료할 때까지 10초간 대기 (필수)
+    - name: Wait for K8s API to release port 30080
+      pause:
+        seconds: 10
+
+    # 3. 새로운 매니페스트 복사 및 적용
+    - name: Copy Manifest
+      copy: { src: ./k8s-manifests/3tier-stack.yaml, dest: /tmp/3tier-stack.yaml }
+    
+    - name: kubectl apply
+      command: kubectl apply -f /tmp/3tier-stack.yaml
+      environment: { KUBECONFIG: /etc/kubernetes/admin.conf }

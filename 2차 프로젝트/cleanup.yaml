@@ -1,0 +1,87 @@
+---
+- name: Complete Reset of Project00 Infrastructure (Enhanced)
+  hosts: all
+  become: yes
+  tasks:
+    # 1. 공통: 호스트 접속 확인 및 변수 설정
+    - name: Check installed components
+      shell: |
+        which kubeadm || true
+        which nginx || true
+        which mariadb || true
+      register: component_check
+      changed_when: false
+
+    # 2. 쿠버네티스 노드 초기화 (Master & Worker)
+    - name: Reset Kubernetes
+      shell: |
+        kubeadm reset -f
+        rm -rf /etc/cni/net.d /opt/cni/bin /var/lib/etcd /etc/kubernetes ~/.kube/config
+      when: "'kubeadm' in component_check.stdout"
+      ignore_errors: yes
+
+    # 3. Nginx 프록시 및 SSL 초기화 (Proxies)
+    - name: Stop and Cleanup Nginx & SSL
+      service:
+        name: nginx
+        state: stopped
+        enabled: no
+      when: "'nginx' in component_check.stdout"
+      ignore_errors: yes
+
+    - name: Remove Nginx and SSL directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/nginx/conf.d/
+        - /etc/nginx/sites-enabled/
+        - /etc/nginx/sites-available/
+        - /etc/nginx/ssl/       # <-- 추가: 기존 인증서 삭제
+        - /var/log/nginx/
+      when: "'nginx' in component_check.stdout"
+
+    # 4. Keepalived 초기화 (Proxies)
+    - name: Stop and Cleanup Keepalived
+      service:
+        name: keepalived
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Remove Keepalived config
+      file:
+        path: /etc/keepalived/keepalived.conf
+        state: absent
+
+    # 5. Galera DB 초기화 (DB Servers) - 중요!
+    - name: Stop and Cleanup MariaDB/Galera
+      service:
+        name: mariadb
+        state: stopped
+        enabled: no
+      when: "'mariadb' in component_check.stdout"
+      ignore_errors: yes
+
+    - name: Purge MariaDB packages and Data
+      shell: |
+        apt-get purge -y mariadb-server mariadb-client galera-4
+        apt-get autoremove -y
+        rm -rf /var/lib/mysql/    # <-- 추가: DB 데이터 완전 삭제
+        rm -rf /etc/mysql/
+      when: "'mariadb' in component_check.stdout"
+
+    # 6. 네트워크 설정 초기화 (iptables 등)
+    - name: Flush iptables (Network Cleanup)
+      shell: |
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+        ip link delete cni0 || true
+        ip link delete flannel.1 || true
+      ignore_errors: yes
+
+    - name: Remove Temp SSL files on Controller
+      delegate_to: localhost
+      file:
+        path: "./ssl_temp/"
+        state: absent
+      run_once: true

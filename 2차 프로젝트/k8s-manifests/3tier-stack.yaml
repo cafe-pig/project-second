@@ -1,0 +1,77 @@
+# 2. WAS 계층 배포 (회원가입/로그인 기능 완성형)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: project00-was
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: was
+  template:
+    metadata:
+      labels:
+        app: was
+    spec:
+      containers:
+      - name: board-app
+        image: python:3.9-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            pip install flask mysql-connector-python
+            cat <<EOF > app.py
+            from flask import Flask, request, render_template_string, redirect, session
+            import mysql.connector
+
+            app = Flask(__name__)
+            app.secret_key = 'project00_secret_key'
+            db_config = {'host': 'external-db', 'user': 'root', 'password': '', 'database': 'project00_db'}
+
+            @app.route('/')
+            def index():
+                user = session.get('user')
+                conn = mysql.connector.connect(**db_config)
+                cursor = conn.cursor()
+                cursor.execute("SELECT title, author FROM posts ORDER BY id DESC")
+                posts = cursor.fetchall()
+                conn.close()
+                return render_template_string("""
+                    <h1>Project00 게시판</h1>
+                    {% if user %} <p><b>{{ user }}</b>님 환영합니다! | <a href='/logout'>로그아웃</a></p>
+                    {% else %} <a href='/login'>로그인</a> | <a href='/register'>회원가입</a> {% endif %}
+                    <hr><h3>게시글 목록</h3>
+                    <ul>{% for p in posts %}<li>{{ p[0] }} (작성자: {{ p[1] }})</li>{% endfor %}</ul>
+                """, user=user, posts=posts)
+
+            @app.route('/register', methods=['GET', 'POST'])
+            def register():
+                if request.method == 'POST':
+                    try:
+                        conn = mysql.connector.connect(**db_config)
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (request.form['u'], request.form['p']))
+                        conn.commit(); conn.close()
+                        return redirect('/login')
+                    except: return "이미 존재하는 ID이거나 오류가 발생했습니다."
+                return "<h2>회원가입</h2><form method='post'>ID: <input name='u'> PW: <input type='password' name='p'><button>가입</button></form>"
+
+            @app.route('/login', methods=['GET', 'POST'])
+            def login():
+                if request.method == 'POST':
+                    conn = mysql.connector.connect(**db_config)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT username FROM users WHERE username=%s AND password=%s", (request.form['u'], request.form['p']))
+                    user = cursor.fetchone()
+                    conn.close()
+                    if user: session['user'] = user[0]; return redirect('/')
+                    else: return "로그인 실패!"
+                return "<h2>로그인</h2><form method='post'>ID: <input name='u'> PW: <input type='password' name='p'><button>로그인</button></form>"
+
+            @app.route('/logout')
+            def logout(): session.pop('user', None); return redirect('/')
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=5000)
+            EOF
+            python3 app.py

@@ -1,0 +1,21 @@
+[galera]
+# Galera Cluster 활성화
+wsrep_on=ON
+wsrep_provider=/usr/lib/galera/libgalera_smm.so
+
+# 클러스터 노드 리스트 (본인의 DB IP에 맞게 수정하세요)
+wsrep_cluster_address="gcomm://172.16.30.201,172.16.30.202,172.16.30.203"
+
+# 현재 노드의 정보 (앤서블 변수 활용)
+wsrep_node_address="{{ ansible_host }}"
+wsrep_node_name="{{ inventory_hostname }}"
+
+# 클러스터 이름 및 동기화 방식
+wsrep_cluster_name="project00_galera_cluster"
+wsrep_sst_method=rsync
+
+# InnoDB 최적화 (Galera 필수 권장값)
+binlog_format=row
+default_storage_engine=InnoDB
+innodb_autoinc_lock_mode=2
+innodb_doublewrite=1

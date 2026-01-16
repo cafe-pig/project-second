@@ -1,0 +1,15 @@
+vrrp_instance VI_1 {
+    state {{ 'MASTER' if inventory_hostname == 'proxy-101' else 'BACKUP' }}
+    # interface eth1 <--- 이 부분을 아래와 같이 수정
+    interface ens160 
+    virtual_router_id 51
+    priority {{ 150 if inventory_hostname == 'proxy-101' else 100 }}
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 4321
+    }
+    virtual_ipaddress {
+        172.16.10.105/24
+    }
+}

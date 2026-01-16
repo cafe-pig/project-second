@@ -1,0 +1,130 @@
+# ==========================================================
+# 1. 업스트림 정의 (고가용성 부하 분산)
+# ==========================================================
+
+upstream k8s_backend {
+    server 172.16.20.27:30080 max_fails=3 fail_timeout=30s;
+    server 172.16.20.28:30080 max_fails=3 fail_timeout=30s;
+    keepalive 32;
+}
+
+upstream db_cluster {
+    server 172.16.30.202:80;
+    server 172.16.30.203:80;
+}
+
+# ==========================================================
+# 2. 도메인 기반 가상 호스트 (Server Blocks)
+# ==========================================================
+
+# 공통 설정 적용을 위해 각 server 블록 내부에 설정을 포함하거나 
+# 혹은 nginx.conf의 http 블록에 넣어야 하지만, 여기서는 server 블록별로 정리합니다.
+
+# [A] Kubernetes Cluster
+server {
+    listen 443 ssl;
+    server_name k8s.project00.com;
+
+    ssl_certificate     /etc/nginx/ssl/project00.crt;
+    ssl_certificate_key /etc/nginx/ssl/project00.key;
+
+    # SSL 보안 최적화 (에러 방지를 위해 블록 내부로 이동)
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_session_timeout     1d;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        proxy_pass http://k8s_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# [B] Exchange Server
+server {
+    listen 443 ssl;
+    server_name mail.project00.com;
+
+    ssl_certificate     /etc/nginx/ssl/project00.crt;
+    ssl_certificate_key /etc/nginx/ssl/project00.key;
+
+    location / {
+        proxy_pass https://172.16.20.25:443;
+        proxy_ssl_verify off;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+# [C] VDI
+server {
+    listen 443 ssl;
+    server_name vdi.project00.com;
+
+    ssl_certificate     /etc/nginx/ssl/project00.crt;
+    ssl_certificate_key /etc/nginx/ssl/project00.key;
+
+    location / {
+        proxy_pass https://172.16.20.240:443;
+        proxy_ssl_verify off;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+    }
+}
+
+# [D] Veeam Backup
+server {
+    listen 443 ssl;
+    server_name veeam.project00.com;
+
+    ssl_certificate     /etc/nginx/ssl/project00.crt;
+    ssl_certificate_key /etc/nginx/ssl/project00.key;
+
+    location / {
+        proxy_pass https://172.16.30.101:443;
+        proxy_ssl_verify off;
+        proxy_set_header Host $host;
+    }
+}
+
+# [E] Database Admin
+server {
+    listen 443 ssl;
+    server_name db.project00.com;
+
+    ssl_certificate     /etc/nginx/ssl/project00.crt;
+    ssl_certificate_key /etc/nginx/ssl/project00.key;
+
+    location / {
+        proxy_pass http://db_cluster;
+        proxy_set_header Host $host;
+    }
+}
+
+# [F] HTTP -> HTTPS 리다이렉트
+server {
+    listen 80;
+    server_name .project00.com;
+    return 301 https://$host$request_uri;
+}
+
+# [G] Monitoring - Stub Status (Exporter 전용)
+server {
+    listen 80;
+    server_name localhost;
+
+    location /metrics {
+        stub_status on;
+        allow 127.0.0.1;  # 로컬(Exporter) 접속 허용
+        deny all;         # 외부 접속 차단
+    }
+}
